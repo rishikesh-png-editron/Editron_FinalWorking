@@ -1,0 +1,1433 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { motion } from "framer-motion";
+import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { toast } from "@/hooks/use-toast";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Switch } from "@/components/ui/switch";
+import {
+  Upload,
+  FileAudio,
+  FileVideo,
+  Sparkles,
+  Loader2,
+  Trash2,
+  Plus,
+  Download,
+  Play,
+  Pause,
+  Wand2,
+  Film,
+  Type as TypeIcon,
+  Settings2,
+  CheckCircle2,
+  AlertCircle,
+  Video,
+  Clapperboard,
+  Anchor,
+  AudioLines,
+  Pencil,
+} from "lucide-react";
+import { INDIAN_LANGUAGES, INTERNATIONAL_LANGUAGES, getFontFamily } from "@/lib/languages";
+import {
+  DEFAULT_STYLE,
+  downloadFile,
+  formatClock,
+  generateSRT,
+  generateTXT,
+  generateVTT,
+  type CaptionSegment,
+  type CaptionStyle,
+} from "@/lib/captions";
+import { CaptionPreview } from "./caption-preview";
+import { StylePanel } from "./style-panel";
+import { BRollPanel } from "./broll-panel";
+import { activeBrollAt, type BRollClip } from "@/lib/broll";
+import { cn } from "@/lib/utils";
+import { applyAutoEmojis } from "@/lib/emojis";
+
+type Stage = "idle" | "uploading" | "transcribing" | "timing" | "done" | "error";
+
+const STAGE_LABELS: Record<Stage, string> = {
+  idle: "Idle",
+  uploading: "Uploading file…",
+  transcribing: "Transcribing speech with Whisper AI…",
+  timing: "Aligning word timings…",
+  done: "Captions ready",
+  error: "Something went wrong",
+};
+
+const ACCEPTED = ".mp4,.mp3,.wav,.m4a,.webm,.mov,.ogg,.aac,.mkv";
+
+export function CaptionStudio() {
+  const [file, setFile] = useState<File | null>(null);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [isAudio, setIsAudio] = useState(false);
+  const [language, setLanguage] = useState("en-US");
+  const [stage, setStage] = useState<Stage>("idle");
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [segments, setSegments] = useState<CaptionSegment[]>([]);
+  const [style, setStyle] = useState<CaptionStyle>(DEFAULT_STYLE);
+  const [brolls, setBrolls] = useState<BRollClip[]>([]);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [aspectRatio, setAspectRatio] = useState<number>(16 / 9);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const [activeTab, setActiveTab] = useState<"preview" | "captions" | "style" | "broll">("preview");
+  const [wordsPerCaption, setWordsPerCaption] = useState(3);
+  const [captionSpeed, setCaptionSpeed] = useState(1.0);
+  const [isExportingVideo, setIsExportingVideo] = useState(false);
+  const [exportQuality, setExportQuality] = useState<"480p" | "720p" | "1080p">("1080p");
+  const [hookTitleEnabled, setHookTitleEnabled] = useState(false);
+  const [hookTitle, setHookTitle] = useState<string>("");
+  const [hookTitleLoading, setHookTitleLoading] = useState(false);
+  const [hookTitleEditing, setHookTitleEditing] = useState(false);
+  const [cleanAudioEnabled, setCleanAudioEnabled] = useState(false);
+  const [autoEmojiEnabled, setAutoEmojiEnabled] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
+  const [exportMsg, setExportMsg] = useState<string | null>(null);
+
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  useEffect(() => {
+    if (segments.length === 0) return;
+
+    setSegments((prev) => {
+      return prev.map(s => ({
+        ...s,
+        text: autoEmojiEnabled
+          ? applyAutoEmojis(s.text)
+          : s.text.replace(/[\\u{1F300}-\\u{1F9FF}\\u{2600}-\\u{26FF}\\u{1F600}-\\u{1F64F}]/gu, "").trim()
+      }));
+    });
+  }, [autoEmojiEnabled]);
+
+  const handleFile = useCallback(
+    (f: File | null) => {
+      if (!f) return;
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
+      const url = URL.createObjectURL(f);
+      setFile(f);
+      setVideoUrl(url);
+      setIsAudio(!f.type.startsWith("video/"));
+      setSegments([]);
+      setStage("idle");
+      setErrorMsg(null);
+      setAspectRatio(16 / 9);
+    },
+    [videoUrl]
+  );
+
+  useEffect(() => {
+    let frameId: number;
+    const updateTime = () => {
+      if (videoRef.current && !videoRef.current.paused) {
+        setCurrentTime(videoRef.current.currentTime);
+      }
+      frameId = requestAnimationFrame(updateTime);
+    };
+    updateTime();
+    return () => cancelAnimationFrame(frameId);
+  }, []);
+
+  const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setDragOver(false);
+    const f = e.dataTransfer.files?.[0] || null;
+    handleFile(f);
+  };
+
+  const generate = async () => {
+    if (!file) {
+      setErrorMsg("Upload a file first.");
+      setStage("error");
+      return;
+    }
+    setErrorMsg(null);
+    setStage("uploading");
+
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("language", language);
+      fd.append("words_per_caption", String(wordsPerCaption));
+
+      setTimeout(() => setStage("transcribing"), 250);
+
+      const res = await fetch("/api/transcribe", {
+        method: "POST",
+        body: fd,
+      });
+      const data = await res.json();
+
+      if (!data.success) {
+        throw new Error(data.error || "Transcription failed.");
+      }
+
+      if (data.tightenedVideoUrl) {
+        setVideoUrl(`/api/video?path=${encodeURIComponent(data.tightenedVideoUrl)}`);
+      }
+
+      setStage("timing");
+      await new Promise((r) => setTimeout(r, 250));
+
+      const rawSegs: any[] = (data.captions || []).map(
+        (c: { id?: string; start: number; end: number; text: string }, i: number) => ({
+          id: c.id || `seg-${i}-${Math.random().toString(36).slice(2, 8)}`,
+          start: c.start,
+          end: c.end,
+          text: c.text,
+        })
+      );
+
+      const segs: CaptionSegment[] = rawSegs.map(s => ({
+        ...s,
+        text: applyAutoEmojis(s.text)
+      }));
+
+      if (segs.length === 0) {
+        throw new Error("No captions generated. Try a different file with clearer speech.");
+      }
+
+      setSegments(segs);
+      if (data.language && data.language.length >= 2) {
+        setLanguage(data.language);
+      }
+      setStage("done");
+      setActiveTab("captions");
+      setAutoEmojiEnabled(true);
+      toast({
+        title: "Captions ready!",
+        description: `${segs.length} segments · language: ${data.language || language}${data.languageProbability ? ` (${Math.round(data.languageProbability * 100)}%)` : ""}`,
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Transcription failed.";
+      setErrorMsg(msg);
+      setStage("error");
+      toast({
+        title: "Transcription failed",
+        description: msg,
+        variant: "destructive",
+      });
+    }
+  };
+
+  const loadSample = async () => {
+    try {
+      setStage("uploading");
+      setErrorMsg(null);
+      const res = await fetch("/api/sample-transcript");
+      const data = await res.json();
+      if (!data.success) throw new Error("Failed to load sample.");
+      setStage("timing");
+      await new Promise((r) => setTimeout(r, 250));
+      setSegments(
+        (data.segments as Array<{ start: number; end: number; text: string }>).map((s, i) => ({
+          id: `sample-${i}-${Math.random().toString(36).slice(2, 6)}`,
+          start: s.start,
+          end: s.end,
+          text: s.text,
+        }))
+      );
+      setLanguage(data.language || "en-US");
+      setStage("done");
+      setActiveTab("captions");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Sample load failed.";
+      setErrorMsg(msg);
+      setStage("error");
+    }
+  };
+
+  const updateSegment = (id: string, patch: Partial<CaptionSegment>) => {
+    setSegments((prev) => prev.map((s) => {
+      if (s.id === id) {
+        let finalText = patch.text ?? s.text;
+        if (autoEmojiEnabled && patch.text) {
+          finalText = applyAutoEmojis(finalText);
+        }
+        return { ...s, ...patch, text: finalText };
+      }
+      return s;
+    }));
+  };
+
+  const deleteSegment = (id: string) => {
+    setSegments((prev) => prev.filter((s) => s.id !== id));
+  };
+  const addSegment = () => {
+    const lastEnd = segments.length ? segments[segments.length - 1].end : 0;
+    const seg: CaptionSegment = {
+      id: `seg-new-${Math.random().toString(36).slice(2, 8)}`,
+      start: lastEnd,
+      end: +(lastEnd + 1.5).toFixed(3),
+      text: "new caption",
+    };
+    setSegments((prev) => [...prev, seg]);
+    setEditingId(seg.id);
+    setEditText(seg.text);
+  };
+  const commitEdit = (id: string) => {
+    let finalText = editText.trim() || " ";
+    if (autoEmojiEnabled) {
+      finalText = applyAutoEmojis(finalText);
+    }
+    updateSegment(id, { text: finalText });
+    setEditingId(null);
+    setEditText("");
+  };
+
+  const seekTo = (t: number) => {
+    if (videoRef.current) {
+      videoRef.current.currentTime = t;
+      setCurrentTime(t);
+      if (!isPlaying) {
+        videoRef.current.play().catch(() => {});
+      }
+    }
+  };
+
+  const togglePlay = () => {
+    if (!videoRef.current) return;
+    if (videoRef.current.paused) {
+      videoRef.current.play().catch(() => {});
+    } else {
+      videoRef.current.pause();
+    }
+  };
+
+  const exportSRT = () => {
+    if (!segments.length) return;
+    downloadFile("capgen-captions.srt", generateSRT(segments), "application/x-subrip");
+  };
+  const exportVTT = () => {
+    if (!segments.length) return;
+    downloadFile("capgen-captions.vtt", generateVTT(segments), "text/vtt");
+  };
+  const exportTXT = () => {
+    if (!segments.length) return;
+    downloadFile("capgen-transcript.txt", generateTXT(segments), "text/plain");
+  };
+
+  const exportVideo = async () => {
+    const video = videoRef.current;
+    if (!video || !segments.length || !videoUrl) return;
+
+    setIsExportingVideo(true);
+    setExportProgress(0);
+    setExportMsg("Preparing canvas…");
+
+    try {
+      if (!video.videoWidth || !video.videoHeight) {
+        await new Promise<void>((resolve, reject) => {
+          const onLoad = () => resolve();
+          const onError = () => reject(new Error("Video failed to load"));
+          video.addEventListener("loadedmetadata", onLoad, { once: true });
+          video.addEventListener("error", onError, { once: true });
+          setTimeout(() => reject(new Error("Video metadata timeout")), 5000);
+        });
+      }
+
+      const vw = video.videoWidth || 1280;
+      const vh = video.videoHeight || 720;
+
+      const QUALITY_LONG_SIDE: Record<typeof exportQuality, number> = {
+        "480p": 480,
+        "720p": 720,
+        "1080p": 1080,
+      };
+      const maxDim = QUALITY_LONG_SIDE[exportQuality];
+      let cw: number;
+      let ch: number;
+      if (aspectRatio >= 1) {
+        cw = maxDim;
+        ch = Math.round(maxDim / aspectRatio);
+      } else {
+        ch = maxDim;
+        cw = Math.round(maxDim * aspectRatio);
+      }
+      cw = cw % 2 === 0 ? cw : cw + 1;
+      ch = ch % 2 === 0 ? ch : ch + 1;
+
+      const canvas = document.createElement("canvas");
+      canvas.width = cw;
+      canvas.height = ch;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("Canvas not supported");
+
+      const canvasStream = canvas.captureStream(30);
+
+      let combinedStream: MediaStream = canvasStream;
+      let cleanupAudioContext: (() => void) | null = null;
+      try {
+        const videoEl = video as HTMLVideoElement & { captureStream?: () => MediaStream; mozCaptureStream?: () => MediaStream };
+        const vStream = videoEl.captureStream?.() || videoEl.mozCaptureStream?.();
+        if (vStream) {
+          const audioTracks = vStream.getAudioTracks();
+          if (audioTracks.length > 0) {
+            let cleanedTrackAdded = false;
+            if (cleanAudioEnabled) {
+              try {
+                const audioCtx = new AudioContext();
+                await audioCtx.resume();
+                const source = audioCtx.createMediaStreamSource(new MediaStream(audioTracks));
+                const highpass = audioCtx.createBiquadFilter();
+                highpass.type = "highpass";
+                highpass.frequency.value = 90;
+                const compressor = audioCtx.createDynamicsCompressor();
+                compressor.threshold.value = -28;
+                compressor.knee.value = 24;
+                compressor.ratio.value = 4;
+                compressor.attack.value = 0.005;
+                compressor.release.value = 0.15;
+                const makeupGain = audioCtx.createGain();
+                makeupGain.gain.value = 1.15;
+                const dest = audioCtx.createMediaStreamDestination();
+                source.connect(highpass);
+                highpass.connect(compressor);
+                compressor.connect(makeupGain);
+                makeupGain.connect(dest);
+                const cleanedTracks = dest.stream.getAudioTracks();
+                if (cleanedTracks.length === 0) throw new Error("No output track from audio graph");
+                cleanedTracks.forEach((t) => canvasStream.addTrack(t));
+                cleanupAudioContext = () => audioCtx.close().catch(() => {});
+                cleanedTrackAdded = true;
+                toast({ title: "Clean Audio applied", description: "High-pass filter + compression active for this export." });
+              } catch (audioErr) {
+                console.error("[exportVideo] Clean Audio processing failed, falling back to raw audio:", audioErr);
+                toast({
+                  title: "Clean Audio unavailable",
+                  description: "Couldn't process audio in this browser — exporting with original audio instead.",
+                  variant: "destructive",
+                });
+              }
+            }
+            if (!cleanedTrackAdded) {
+              audioTracks.forEach((at) => canvasStream.addTrack(at));
+            }
+          }
+        }
+      } catch {
+      }
+
+      const mimeCandidates = [
+        "video/webm;codecs=vp9,opus",
+        "video/webm;codecs=vp8,opus",
+        "video/webm;codecs=vp9",
+        "video/webm;codecs=vp8",
+        "video/webm",
+        "video/mp4",
+      ];
+      const mimeType = mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m)) || "video/webm";
+      const fileExt = mimeType.includes("mp4") ? "mp4" : "webm";
+
+      const recorder = new MediaRecorder(combinedStream, {
+        mimeType,
+        videoBitsPerSecond:
+          exportQuality === "1080p" ? 8_000_000 : exportQuality === "720p" ? 5_000_000 : 2_500_000,
+      });
+
+      const chunks: Blob[] = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
+      const done = new Promise<Blob>((resolve) => {
+        recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+      });
+
+      video.pause();
+      video.currentTime = 0;
+      video.muted = true;
+      await new Promise((r) => setTimeout(r, 100));
+
+      const totalDuration = video.duration || segments[segments.length - 1]?.end || 10;
+
+      const fontFamilyCss = getFontFamily(style.fontFamily);
+      const fontWeight = style.bold ? "800" : "500";
+      const fontStyle = style.italic ? "italic" : "normal";
+
+      const brollEls = new Map<string, HTMLVideoElement>();
+      let brollTainted = false;
+      let lastActiveBrollId: string | null = null;
+      if (brolls.length) {
+        setExportMsg("Loading b-roll clips…");
+        await Promise.all(
+          brolls.map(
+            (b) =>
+              new Promise<void>((resolve) => {
+                if (brollEls.has(b.previewUrl)) return resolve();
+                const el = document.createElement("video");
+                el.crossOrigin = "anonymous";
+                el.src = b.previewUrl;
+                el.muted = true;
+                el.loop = true;
+                el.playsInline = true;
+                el.preload = "auto";
+                const done = () => resolve();
+                el.addEventListener("loadeddata", done, { once: true });
+                el.addEventListener("error", done, { once: true });
+                setTimeout(done, 4000);
+                brollEls.set(b.previewUrl, el);
+                el.load();
+              })
+          )
+        );
+      }
+
+      setExportMsg("Recording…");
+
+      recorder.start(100);
+      await video.play();
+
+      const renderFrame = () => {
+        if (video.paused || video.ended) {
+          finishExport();
+          return;
+        }
+        const t = video.currentTime;
+
+        const activeBroll = !brollTainted ? brolls.find((b) => t >= b.start && t < b.end) : undefined;
+        const brollEl = activeBroll ? brollEls.get(activeBroll.previewUrl) : undefined;
+
+        if (activeBroll?.id !== lastActiveBrollId) {
+          if (lastActiveBrollId) {
+            const prevBroll = brolls.find((b) => b.id === lastActiveBrollId);
+            const prevEl = prevBroll ? brollEls.get(prevBroll.previewUrl) : undefined;
+            prevEl?.pause();
+          }
+          if (brollEl) {
+            brollEl.currentTime = 0;
+            brollEl.play().catch(() => {});
+          }
+          lastActiveBrollId = activeBroll?.id ?? null;
+        }
+
+        try {
+          if (brollEl && brollEl.readyState >= 2) {
+            drawCover(ctx, brollEl, brollEl.videoWidth, brollEl.videoHeight, cw, ch);
+          } else {
+            drawCover(ctx, video, vw, vh, cw, ch);
+          }
+        } catch {
+          brollTainted = true;
+          drawCover(ctx, video, vw, vh, cw, ch);
+          toast({
+            title: "B-roll export limited",
+            description: "One or more b-roll sources blocked canvas capture (CORS). Continuing export without cutaways.",
+            variant: "destructive",
+          });
+        }
+
+        const seg = segments.find((s) => t >= s.start && t < s.end);
+        if (seg) {
+          drawCaption(ctx, seg, cw, ch, style, fontFamilyCss, fontWeight, fontStyle, t);
+        }
+
+        if (hookTitleEnabled && hookTitle) {
+          drawHookTitle(ctx, hookTitle, cw, ch);
+        }
+
+        setExportProgress(Math.min(100, Math.round((t / totalDuration) * 100)));
+
+        if (t < totalDuration) {
+          requestAnimationFrame(renderFrame);
+        } else {
+          finishExport();
+        }
+      };
+
+      const finishExport = () => {
+        if (recorder.state !== "inactive") {
+          recorder.stop();
+        }
+        video.pause();
+        video.muted = false;
+        brollEls.forEach((el) => {
+          el.pause();
+          el.src = "";
+        });
+        cleanupAudioContext?.();
+      };
+
+      requestAnimationFrame(renderFrame);
+
+      const blob = await done;
+      combinedStream.getTracks().forEach((t) => t.stop());
+
+      setExportMsg("Saving file…");
+      setExportProgress(100);
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `capgen-captioned-video.${fileExt}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+      setExportMsg(null);
+      setIsExportingVideo(false);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Video export failed";
+      console.error("[exportVideo]", msg);
+      setExportMsg(`Export failed: ${msg}`);
+      setIsExportingVideo(false);
+      setTimeout(() => setExportMsg(null), 5000);
+    }
+  };
+
+  const updateStyle = (patch: Partial<CaptionStyle>) => {
+    setStyle((s) => {
+      const updated = { ...s, ...patch };
+
+      if (patch.hyperStyleId) {
+        const styleId = patch.hyperStyleId;
+        if (styleId === "pop-cinematic") {
+          updated.textColor = "#FFFFFF";
+          updated.highlightColor = "#FF6B1A";
+          updated.fontFamily = "archivo-black";
+          updated.template = "active-word";
+          updated.animation = "pop";
+        } else if (styleId === "mr-beast-style") {
+          updated.textColor = "#FFFF00";
+          updated.highlightColor = "#FFFFFF";
+          updated.fontFamily = "anton";
+          updated.template = "active-word";
+          updated.animation = "pop";
+          updated.uppercase = true;
+        } else if (styleId === "minimal-doc") {
+          updated.textColor = "#EEEEEE";
+          updated.highlightColor = "#FFFFFF";
+          updated.fontFamily = "inter";
+          updated.template = "plain";
+          updated.animation = "none";
+          updated.uppercase = false;
+        } else if (styleId === "hormozi-energy") {
+          updated.textColor = "#FFFFFF";
+          updated.highlightColor = "#CFFF00";
+          updated.fontFamily = "bebas-neue";
+          updated.template = "active-word";
+          updated.animation = "pop";
+          updated.uppercase = true;
+        } else if (styleId === "luxury-aesthetic") {
+          updated.textColor = "#FFFFFF";
+          updated.highlightColor = "#F5F5F5";
+          updated.fontFamily = "playfair-display";
+          updated.template = "plain";
+          updated.animation = "slide";
+          updated.uppercase = false;
+          updated.italic = true;
+        } else if (styleId === "cyber-neon") {
+          updated.textColor = "#00FFFF";
+          updated.highlightColor = "#FF00FF";
+          updated.fontFamily = "russo-one";
+          updated.template = "active-word";
+          updated.animation = "pop";
+          updated.bgColor = "#000000";
+          updated.bgOpacity = 70;
+        } else if (styleId === "podcast-clean") {
+          updated.textColor = "#FFFFFF";
+          updated.highlightColor = "#FFB800";
+          updated.fontFamily = "montserrat";
+          updated.template = "active-word";
+          updated.animation = "slide";
+          updated.uppercase = false;
+        } else if (styleId === "viral-breaking") {
+          updated.textColor = "#FFFFFF";
+          updated.highlightColor = "#FFFFFF";
+          updated.fontFamily = "archivo-black";
+          updated.template = "boxed";
+          updated.animation = "pop";
+          updated.bgColor = "#FF0000";
+          updated.bgOpacity = 100;
+          updated.uppercase = true;
+        }
+      }
+
+      return updated;
+    });
+  };
+
+  const generateHookTitle = useCallback(async () => {
+    if (!segments.length) return;
+    setHookTitleLoading(true);
+    try {
+      const res = await fetch("/api/hook-title", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          segments: segments.map((s) => ({ start: s.start, end: s.end, text: s.text })),
+        }),
+      });
+      const data = await res.json();
+      if (data.success && data.title) {
+        setHookTitle(data.title);
+      } else {
+        toast({ title: "Hook title failed", description: data.error || "Try again.", variant: "destructive" });
+      }
+    } catch {
+      toast({ title: "Hook title failed", description: "Network error.", variant: "destructive" });
+    } finally {
+      setHookTitleLoading(false);
+    }
+  }, [segments]);
+
+  const toggleHookTitle = (enabled: boolean) => {
+    setHookTitleEnabled(enabled);
+    if (enabled && !hookTitle && segments.length) {
+      generateHookTitle();
+    }
+  };
+
+  const canExport = segments.length > 0;
+  const activeIdx = segments.findIndex((s) => currentTime >= s.start && currentTime < s.end);
+
+  return (
+    <section id="studio" className="relative scroll-mt-20 bg-background py-14 sm:py-20">
+      <div className="mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8">
+        {/* Header */}
+        <div className="mb-8 text-center">
+          <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-border bg-secondary px-3 py-1 text-xs font-semibold text-foreground">
+            <Sparkles className="size-3.5" />
+            Live caption studio
+          </div>
+          <h2 className="text-balance text-3xl font-extrabold tracking-tight text-white sm:text-4xl">
+            Caption a video <span className="capgen-gradient-text">right now</span>
+          </h2>
+          <p className="mx-auto mt-3 max-w-2xl text-base text-muted-foreground">
+            Upload a clip, pick a language, hit generate. Edit word timings, style the captions, export SRT — all in your browser.
+          </p>
+        </div>
+
+        {/* Studio card */}
+        <div className="overflow-hidden rounded-3xl border border-border bg-card shadow-2xl">
+          {/* Toolbar */}
+          <div className="flex flex-col gap-3 border-b border-border bg-background px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+            <div className="flex items-center gap-3">
+              <div className="grid size-9 place-items-center rounded-lg bg-primary text-primary-foreground shadow-sm">
+                <Film className="size-4.5" />
+              </div>
+              <div>
+                <div className="text-sm font-bold text-white">Editron Studio</div>
+                <div className="text-xs text-muted-foreground">
+                  {file ? file.name : "No file loaded"}{" "}
+                  {file && <span className="text-primary">· {(file.size / 1024 / 1024).toFixed(2)} MB</span>}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Select value={language} onValueChange={setLanguage}>
+                <SelectTrigger className="h-9 w-[200px] border-border bg-card text-sm">
+                  <SelectValue placeholder="Language" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectLabel>Indian · 14</SelectLabel>
+                    {INDIAN_LANGUAGES.map((l) => (
+                      <SelectItem key={l.code} value={l.code}>
+                        {l.name}
+                        {l.roman && (
+                          <span className="ml-1 rounded bg-secondary px-1 text-[10px] uppercase text-primary">
+                            roman
+                          </span>
+                        )}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                  <SelectGroup>
+                    <SelectLabel>International · 68</SelectLabel>
+                    {INTERNATIONAL_LANGUAGES.map((l) => (
+                      <SelectItem key={l.code} value={l.code}>
+                        {l.name}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <div className="flex h-9 items-center gap-2 rounded-md border border-border bg-card px-3">
+                      <Label htmlFor="wpc-input" className="text-xs font-medium text-muted-foreground">
+                        Words/caption
+                      </Label>
+                      <Input
+                        id="wpc-input"
+                        type="number"
+                        min={1}
+                        max={12}
+                        value={wordsPerCaption}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10);
+                          if (!isNaN(v)) setWordsPerCaption(Math.max(1, Math.min(12, v)));
+                          else setWordsPerCaption(6);
+                        }}
+                        className="h-6 w-12 border-transparent bg-transparent p-0 text-center text-sm text-white [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                      />
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    <p>Words per caption segment (1–12). Lower = more frequent caption pops.</p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+
+              <Button
+                onClick={generate}
+                disabled={!file || stage === "uploading" || stage === "transcribing" || stage === "timing"}
+                className="h-9 bg-primary text-primary-foreground hover:bg-primary/90"
+              >
+                {(stage === "uploading" || stage === "transcribing" || stage === "timing") && (
+                  <Loader2 className="size-4 animate-spin" />
+                )}
+                {stage === "idle" || stage === "done" || stage === "error" ? (
+                  <Wand2 className="size-4" />
+                ) : null}
+                Generate Captions
+              </Button>
+
+              <Button
+                onClick={loadSample}
+                variant="outline"
+                className="h-9 border-border bg-card text-white hover:bg-accent hover:text-foreground"
+              >
+                <Sparkles className="size-4" />
+                Try with sample
+              </Button>
+            </div>
+          </div>
+
+          {/* Progress bar */}
+          {stage !== "idle" && (
+            <div className="border-b border-border bg-card px-4 py-2 sm:px-6">
+              <div className="flex items-center gap-2 text-xs">
+                {stage === "error" ? (
+                  <AlertCircle className="size-4 text-red-500" />
+                ) : stage === "done" ? (
+                  <CheckCircle2 className="size-4 text-primary" />
+                ) : (
+                  <Loader2 className="size-4 animate-spin text-primary" />
+                )}
+                <span className={cn("font-medium", stage === "error" ? "text-red-600" : "text-white")}>
+                  {STAGE_LABELS[stage]}
+                </span>
+                {errorMsg && <span className="text-red-500">— {errorMsg}</span>}
+                {stage === "done" && segments.length > 0 && (
+                  <span className="ml-auto text-muted-foreground">
+                    {segments.length} segments · {segments.reduce((a, s) => a + s.text.split(/\\s+/).length, 0)} words
+                  </span>
+                )}
+              </div>
+              {stage !== "error" && stage !== "done" && (
+                <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-secondary">
+                  <motion.div
+                    className="h-full bg-primary"
+                    initial={false}
+                    animate={{
+                      width:
+                        stage === "uploading" ? "30%" : stage === "transcribing" ? "70%" : stage === "timing" ? "92%" : "100%",
+                    }}
+                    transition={{ duration: 0.5 }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Body */}
+          <div className="grid gap-0 lg:grid-cols-[1.4fr_1fr]">
+            {/* Left: preview + upload */}
+            <div className="border-b border-border p-4 sm:p-6 lg:border-b-0 lg:border-r">
+              {videoUrl ? (
+                <div className="space-y-3">
+                  <CaptionPreview
+                    videoUrl={videoUrl}
+                    isAudio={isAudio}
+                    segments={segments}
+                    currentTime={currentTime}
+                    style={style}
+                    videoRef={videoRef}
+                    aspectRatio={aspectRatio}
+                    onTimeUpdate={(t) => setCurrentTime(t)}
+                    onLoadedMetadata={(d) => setDuration(d)}
+                    onVideoDimensions={(w, h) => {
+                      if (w > 0 && h > 0) {
+                        setAspectRatio(w / h);
+
+                        const baselineSize = Math.round(w * 0.05);
+
+                        if (style.fontSize === DEFAULT_STYLE.fontSize) {
+                          setStyle((s) => ({ ...s, fontSize: Math.max(14, Math.min(120, baselineSize)) }));
+                        }
+                      }
+                    }}
+                    brolls={brolls}
+                    hookTitle={hookTitleEnabled ? hookTitle : ""}
+                    onChangeStyle={(patch) => setStyle((s) => ({ ...s, ...patch }))}
+                  />
+                  {/* Mini player controls */}
+                  <div className="flex items-center gap-3 rounded-lg border border-border bg-background px-3 py-2 relative z-10">
+                    <button
+                      type="button"
+                      onClick={togglePlay}
+                      className="grid size-8 place-items-center rounded-full bg-primary text-primary-foreground shadow-sm hover:bg-primary/90"
+                      aria-label={isPlaying ? "Pause" : "Play"}
+                    >
+                      {isPlaying ? <Pause className="size-4" /> : <Play className="size-4" />}
+                    </button>
+                    <span className="font-mono text-xs text-muted-foreground">
+                      {formatClock(currentTime)} / {formatClock(duration)}
+                    </span>
+                    <div className="ml-auto flex items-center gap-2">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => fileInputRef.current?.click()}
+                        className="text-muted-foreground hover:bg-secondary hover:text-foreground"
+                      >
+                        <Upload className="size-4" />
+                        Replace
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setDragOver(true);
+                  }}
+                  onDragLeave={() => setDragOver(false)}
+                  onDrop={onDrop}
+                  style={{ aspectRatio: "16 / 9" }}
+                  className={cn(
+                    "grid w-full cursor-pointer place-items-center rounded-xl border-2 border-dashed bg-background p-6 text-center transition-all",
+                    dragOver ? "border-primary bg-secondary" : "border-border hover:border-primary hover:bg-secondary"
+                  )}
+                  onClick={() => fileInputRef.current?.click()}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") fileInputRef.current?.click();
+                  }}
+                >
+                  <div className="mx-auto max-w-md">
+                    <div className="mx-auto mb-4 grid size-16 place-items-center rounded-2xl bg-primary text-primary-foreground shadow-lg">
+                      <Upload className="size-7" />
+                    </div>
+                    <h3 className="text-lg font-bold text-white">
+                      Drop a video or audio file
+                    </h3>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      mp4 · mp3 · wav · m4a · webm · mov · up to 150MB
+                    </p>
+                    <div className="mt-4 flex items-center justify-center gap-2">
+                      <Button type="button" className="bg-primary text-primary-foreground hover:bg-primary/90">
+                        <Upload className="size-4" />
+                        Choose file
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          loadSample();
+                        }}
+                        className="border-border bg-card text-white hover:bg-accent hover:text-foreground"
+                      >
+                        <Sparkles className="size-4" />
+                        Try sample
+                      </Button>
+                    </div>
+                    <p className="mt-4 text-xs text-muted-foreground">
+                      Audio is processed locally — only the bytes are sent to /api/transcribe for ASR.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept={ACCEPTED}
+                  onChange={(e) => handleFile(e.target.files?.[0] || null)}
+                  className="hidden"
+                  aria-hidden="true"
+                />
+
+              {/* Export buttons */}
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  Export
+                </span>
+                <Select value={exportQuality} onValueChange={(v) => setExportQuality(v as typeof exportQuality)}>
+                  <SelectTrigger className="h-9 w-[100px] border-border bg-card text-xs">
+                    <SelectValue placeholder="Quality" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="480p">480p</SelectItem>
+                    <SelectItem value="720p">720p</SelectItem>
+                    <SelectItem value="1080p">1080p</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Button
+                  onClick={exportVideo}
+                  disabled={!canExport || isExportingVideo || isAudio}
+                  size="sm"
+                  className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                >
+                  {isExportingVideo ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <Video className="size-3.5" />
+                  )}
+                  {isExportingVideo ? `Exporting ${exportProgress}%` : "Export Video"}
+                </Button>
+                <Button
+                  onClick={exportSRT}
+                  disabled={!canExport}
+                  size="sm"
+                  variant="outline"
+                  className="border-border bg-card text-white hover:bg-accent hover:text-foreground disabled:opacity-50"
+                >
+                  <Download className="size-3.5" />
+                  .SRT
+                </Button>
+                <Button
+                  onClick={exportVTT}
+                  disabled={!canExport}
+                  size="sm"
+                  variant="outline"
+                  className="border-border bg-card text-white hover:bg-accent hover:text-foreground disabled:opacity-50"
+                >
+                  <Download className="size-3.5" />
+                  .VTT
+                </Button>
+                <Button
+                  onClick={exportTXT}
+                  disabled={!canExport}
+                  size="sm"
+                  variant="outline"
+                  className="border-border bg-card text-white hover:bg-accent hover:text-foreground disabled:opacity-50"
+                >
+                  <Download className="size-3.5" />
+                  .TXT
+                </Button>
+                {!canExport && (
+                  <span className="text-xs text-muted-foreground">Generate captions to enable export</span>
+                )}
+                {canExport && isAudio && (
+                  <span className="text-xs text-muted-foreground">Video export needs a video file (not audio-only)</span>
+                )}
+              </div>
+
+              {/* Export progress bar */}
+              {(isExportingVideo || exportMsg) && (
+                <div className="mt-3 rounded-lg border border-border bg-background px-4 py-2">
+                  <div className="flex items-center gap-2 text-xs">
+                    {exportMsg && exportMsg.startsWith("Export failed") ? (
+                      <AlertCircle className="size-4 text-red-500" />
+                    ) : isExportingVideo ? (
+                      <Loader2 className="size-4 animate-spin text-primary" />
+                    ) : (
+                      <Clapperboard className="size-4 text-primary" />
+                    )}
+                    <span className={cn("font-medium", exportMsg?.startsWith("Export failed") ? "text-red-500" : "text-white")}>
+                      {exportMsg || "Processing…"}
+                    </span>
+                  </div>
+                  {isExportingVideo && (
+                    <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-secondary">
+                      <motion.div
+                        className="h-full bg-primary"
+                        initial={false}
+                        animate={{ width: `${exportProgress}%` }}
+                        transition={{ duration: 0.2 }}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* AI Tools */}
+              <div className="mt-4 rounded-lg border border-border bg-background p-3">
+                <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  AI Tools
+                </h4>
+
+                {/* AI Hook Title */}
+                <div className="flex items-center gap-3 border-b border-border py-2.5">
+                  <div className="grid size-8 shrink-0 place-items-center rounded-md bg-secondary text-muted-foreground">
+                    <Anchor className="size-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium text-white">AI Hook Title</div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {hookTitleLoading
+                        ? "Generating…"
+                        : hookTitleEnabled && hookTitle
+                          ? hookTitle
+                          : "Generate an attention-grabbing intro"}
+                    </div>
+                  </div>
+                  {hookTitleEnabled && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        setEditText(hookTitle);
+                        setHookTitleEditing(true);
+                      }}
+                      disabled={hookTitleLoading || !segments.length}
+                      className="h-7 shrink-0 border-border bg-card px-2 text-xs text-white hover:bg-accent"
+                    >
+                      <Pencil className="size-3" />
+                      Edit
+                    </Button>
+                  )}
+                  {hookTitleLoading && <Loader2 className="size-4 shrink-0 animate-spin text-primary" />}
+                  <Switch
+                    checked={hookTitleEnabled}
+                    onCheckedChange={toggleHookTitle}
+                    disabled={!segments.length}
+                    className="shrink-0 data-[state=checked]:bg-primary"
+                  />
+                </div>
+
+                {hookTitleEditing && (
+                  <div className="flex items-center gap-2 border-b border-border py-2.5 pl-11">
+                    <Input
+                      autoFocus
+                      value={editText}
+                      onChange={(e) => setEditText(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          setHookTitle(editText.trim());
+                          setHookTitleEditing(false);
+                        }
+                        if (e.key === "Escape") setHookTitleEditing(false);
+                      }}
+                      className="h-8 border-primary bg-card text-sm"
+                    />
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={() => {
+                        setHookTitle(editText.trim());
+                        setHookTitleEditing(false);
+                      }}
+                      className="h-8 bg-primary text-primary-foreground hover:bg-primary/90"
+                    >
+                      Save
+                    </Button>
+                  </div>
+                )}
+
+                {/* Clean Audio */}
+                <div className="flex items-center gap-3 py-2.5">
+                  <div className="grid size-8 shrink-0 place-items-center rounded-md bg-secondary text-muted-foreground">
+                    <AudioLines className="size-4" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium text-white">Clean Audio</div>
+                    <div className="truncate text-xs text-muted-foreground">Make your audio sound professional</div>
+                  </div>
+                  <Switch
+                    checked={cleanAudioEnabled}
+                    onCheckedChange={(v) => {
+                      setCleanAudioEnabled(v);
+                      if (v) {
+                        toast({
+                          title: "Clean Audio enabled",
+                          description: "This applies when you export the video — there's no live preview for it.",
+                        });
+                      }
+                    }}
+                    disabled={isAudio}
+                    className="shrink-0 data-[state=checked]:bg-primary"
+                  />
+                </div>
+                <p className="mt-1 text-[10px] text-muted-foreground/60">
+                  {isAudio
+                    ? "Clean Audio applies during video export (needs a video file, not audio-only)."
+                    : "Clean Audio has no live preview — it applies when you click Export Video."}
+                </p>
+              </div>
+            </div>
+
+            {/* Right: tabs (captions + style) */}
+            <div className="bg-background p-4 sm:p-6">
+              <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as typeof activeTab)}>
+                <TabsList className="grid w-full grid-cols-4 bg-secondary">
+                  <TabsTrigger value="preview" className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">
+                    <Film className="size-3.5" /> Preview
+                  </TabsTrigger>
+                  <TabsTrigger value="captions" className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">
+                    <TypeIcon className="size-3.5" /> Captions
+                  </TabsTrigger>
+                  <TabsTrigger value="style" className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">
+                    <Settings2 className="size-3.5" /> Style
+                  </TabsTrigger>
+                  <TabsTrigger value="broll" className="data-[state=active]:bg-primary data-[state=active]:text-primary-foreground">
+                    <Clapperboard className="size-3.5" /> B-Roll
+                  </TabsTrigger>
+                </TabsList>
+
+                {/* Preview tab — shows active segment + quick seek */}
+                <TabsContent value="preview" className="mt-4">
+                  <div className="rounded-xl border border-border bg-card p-4">
+                    <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Now playing
+                    </h4>
+                    {activeIdx >= 0 ? (
+                      <div className="rounded-lg bg-secondary px-4 py-3 text-center">
+                        <span
+                          className="font-extrabold uppercase"
+                          style={{
+                            fontFamily: "var(--font-archivo-black), sans-serif",
+                            color: "#FFFFFF",
+                            fontSize: "1.5rem",
+                            lineHeight: 1.1,
+                          }}
+                        >
+                          {segments[activeIdx].text.split(/\\s+/).map((w, i, arr) => (
+                            <span
+                              key={i}
+                              style={{
+                                color: i === 0 ? "var(--primary)" : "#FFFFFF",
+                                marginRight: "0.35em",
+                                display: "inline-block",
+                              }}
+                            >
+                              {w}
+                              {i < arr.length - 1 ? "" : ""}
+                            </span>
+                          ))}
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="rounded-lg bg-secondary px-4 py-6 text-center text-sm text-muted-foreground">
+                        {segments.length
+                          ? "Press play to see captions sync"
+                          : "Generate captions to see live preview here"}
+                      </div>
+                    )}
+
+                    <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
+                      <span>{formatClock(currentTime)} / {formatClock(duration)}</span>
+                      <span>{segments.length} segments</span>
+                    </div>
+                  </div>
+
+                  {/* Quick captions list (compact) */}
+                  <div className="mt-4">
+                    <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Caption timeline
+                    </h4>
+                    <ScrollArea className="capgen-scroll h-64 rounded-lg border border-border bg-card">
+                      <div className="divide-y divide-border">
+                        {segments.length === 0 && (
+                          <div className="p-4 text-center text-sm text-muted-foreground">
+                            No segments yet. Generate or add one.
+                          </div>
+                        )}
+                        {segments.map((seg, i) => (
+                          <button
+                            key={seg.id}
+                            type="button"
+                            onClick={() => seekTo(seg.start)}
+                            className={cn(
+                              "flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors hover:bg-accent",
+                              activeIdx === i && "bg-accent"
+                            )}
+                          >
+                            <span className="font-mono text-[10px] text-muted-foreground">
+                              {formatClock(seg.start)}
+                            </span>
+                            <span className="flex-1 truncate text-white">{seg.text}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </ScrollArea>
+                  </div>
+                </TabsContent>
+
+                {/* Captions tab — full editor */}
+                <TabsContent value="captions" className="mt-4">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      Caption segments ({segments.length})
+                    </h4>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={addSegment}
+                      className="h-7 border-border bg-card text-primary hover:bg-accent"
+                    >
+                      <Plus className="size-3.5" />
+                      Add
+                    </Button>
+                  </div>
+
+                  <ScrollArea className="capgen-scroll mt-2 h-[420px] rounded-lg border border-border bg-card">
+                    <div className="divide-y divide-border">
+                      {segments.length === 0 && (
+                        <div className="p-6 text-center text-sm text-muted-foreground">
+                          No segments yet. Generate captions or click <strong>Add</strong>.
+                        </div>
+                      )}
+                      {segments.map((seg, i) => (
+                        <div
+                          key={seg.id}
+                          className={cn(
+                            "group p-3 transition-colors hover:bg-background",
+                            activeIdx === i && "bg-accent"
+                          )}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="grid size-6 shrink-0 place-items-center rounded bg-secondary text-[10px] font-bold text-primary">
+                              {i + 1}
+                            </span>
+                            <Input
+                              type="number"
+                              step="0.1"
+                              min="0"
+                              value={seg.start.toFixed(2)}
+                              onChange={(e) =>
+                                updateSegment(seg.id, {
+                                  start: Math.max(0, parseFloat(e.target.value) || 0),
+                                })
+                              }
+                              className="h-7 w-20 border-border bg-card font-mono text-xs"
+                              aria-label="Start time"
+                            />
+                            <span className="text-muted-foreground">→</span>
+                            <Input
+                              type="number"
+                              step="0.1"
+                              min="0"
+                              value={seg.end.toFixed(2)}
+                              onChange={(e) =>
+                                updateSegment(seg.id, {
+                                  end: Math.max(0, parseFloat(e.target.value) || 0),
+                                })
+                              }
+                              className="h-7 w-20 border-border bg-card font-mono text-xs"
+                              aria-label="End time"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => seekTo(seg.start)}
+                              className="ml-auto grid size-7 place-items-center rounded text-muted-foreground hover:bg-secondary hover:text-primary"
+                              aria-label="Seek to segment"
+                            >
+                              <Play className="size-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => deleteSegment(seg.id)}
+                              className="grid size-7 place-items-center rounded text-muted-foreground hover:bg-red-50 hover:text-red-500"
+                              aria-label="Delete segment"
+                            >
+                              <Trash2 className="size-3.5" />
+                            </button>
+                          </div>
+
+                          {editingId === seg.id ? (
+                            <Input
+                              autoFocus
+                              value={editText}
+                              onChange={(e) => setEditText(e.target.value)}
+                              onBlur={() => commitEdit(seg.id)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") commitEdit(seg.id);
+                                if (e.key === "Escape") {
+                                  setEditingId(null);
+                                  setEditText("");
+                                }
+                              }}
+                              className="mt-2 h-9 border-primary bg-card text-sm"
+                            />
+                          ) : (
+                            <div
+                              onClick={() => {
+                                setEditingId(seg.id);
+                                setEditText(seg.text);
+                              }}
+                              className="mt-2 cursor-text rounded-md border border-transparent px-2 py-1.5 text-sm text-white hover:border-border hover:bg-background"
+                              title="Click to edit"
+                            >
+                              {seg.text}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </ScrollArea>
+
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    Tip: click any caption text to edit it inline. Click the play icon to seek.
+                  </p>
+                </TabsContent>
+
+                {/* Style tab */}
+                <TabsContent value="broll" className="mt-4">
+                  <BRollPanel segments={segments} brolls={brolls} setBrolls={setBrolls} />
+                </TabsContent>
+
+                <TabsContent value="style" className="mt-4">
+                  <StylePanel
+                    style={style}
+                    onChange={updateStyle}
+                    autoEmojiEnabled={autoEmojiEnabled}
+                    onAutoEmojiChange={setAutoEmojiEnabled}
+                    wordsPerCaption={wordsPerCaption}
+                    onWordsPerCaptionChange={setWordsPerCaption}
+                  />
+                </TabsContent>
+              </Tabs>
+            </div>
+          </div>
+
+          {/* Below studio: file type hints */}
+          <div className="mt-4 flex flex-wrap items-center justify-center gap-4 text-xs text-muted-foreground">
+            <span className="inline-flex items-center gap-1.5">
+              <FileVideo className="size-3.5 text-primary" /> Video: mp4, webm, mov, mkv
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <FileAudio className="size-3.5 text-primary" /> Audio: mp3, wav, m4a, ogg, aac
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <CheckCircle2 className="size-3.5 text-primary" /> 150MB max
+            </span>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
