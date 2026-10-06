@@ -15,7 +15,7 @@ The B-Roll engine was evolved from a simple browser-based recording system to a 
     - **Layered Stack**: Implemented a z-index hierarchy to prevent B-roll from covering UI:
         - `z-0`: Main Video
         - `z-10`: B-Roll Overlay (with `pointer-events-none`)
-        - `z-20`: Captions/Text
+        - `z-20`: Captions/Textt
         - `z-30`: UI Overlays (Aspect ratio tags, Preview labels)
 
 ### B. Backend (Python/Hyper-Engine)
