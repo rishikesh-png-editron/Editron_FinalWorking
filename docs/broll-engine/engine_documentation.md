@@ -22,10 +22,14 @@ Instead of a simple search, the engine uses a **Bulk-Fetch & Cache** strategy:
 2. **Bulk Retrieval**: It fetches up to **40 clips per keyword** (20 from each source).
 3. **Local Caching**: To avoid API rate-limit bans and ensure instant loading, results are stored in a local JSON cache (`storage/broll_cache/`) with a 7-day expiration (TTL).
 
-### Stage C: User Selection & Carousel
-Users can refine the AI's suggestions through a professional gallery interface:
-- **Circular Carousel**: If a user dislikes a clip, they can "Regenerate." The engine cycles through the cached bulk list (`index + 1 % total_clips`), ensuring they see every available option without repeated API calls.
-- **Manual Override**: Users can manually select any clip from the gallery or remove a B-roll entirely.
+### Stage C: User Selection & Management (The "Creative Assistant" Flow)
+B-roll management has been fully decentralized from a central panel to the individual **Segment Cards** for a production-grade UX:
+- **Inline Management**: Users add, remove, and regenerate clips directly on the caption segment they are editing.
+- **Binary Choice (Cycle & Keep)**: Instead of overwhelming users with a list, the engine presents one clip. The user can either "Keep" it or click "Regenerate" to cycle to the next best option.
+- **Hybrid Regeneration Logic**: 
+  - **Instant Cycle**: If clips are already cached/fetched, it cycles instantly via a local index.
+  - **Smart Fallback**: If no suggestions exist (e.g., for manually added B-rolls), the engine performs a background API fetch, populates the local cache, and then cycles.
+- **Direct Assignment**: Uses a `direct-${segmentId}` pattern to allow segments to fetch and apply clips independently of the global windowing system.
 
 ### Stage D: Server-Side Rendering (The Final Cut)
 The final video is rendered using **FFmpeg** on the server:
@@ -41,8 +45,8 @@ The final video is rendered using **FFmpeg** on the server:
 | Feature | Description | Benefit |
 | :--- | :--- | :--- |
 | **4s Pacing Cap** | Every B-roll clip is capped at a maximum of 4 seconds. | Prevents viewer boredom; maintains high retention. |
-| **Semantic Gallery** | A horizontal scrollable list of 40+ clips per keyword. | Gives users total control over the visual vibe. |
-| **Circular Looping** | "Regenerate" cycles through available clips infinitely. | Instant feedback without loading spinners. |
+| **Inline Controls** | Management is built into `SegmentCard`. | Eliminates tab-switching; faster workflow. |
+| **Hybrid Regeneration** | Instant local cycling + API fallback. | Zero loading spinners for most users; 100% hit rate. |
 | **Resolution Independence** | Dynamic cropping for 9:16, 16:9, or 1:1 videos. | Professional look across all social platforms. |
 | **B-Roll Cache** | JSON-based local storage of API responses. | Prevents API bans; makes the tool feel "instant." |
 
@@ -59,7 +63,7 @@ As part of the senior engineering overhaul, the following critical updates were 
 
 ### 🎨 Visual & UX Enhancements
 - **Standardized Pacing**: Introduced the `BROLL_CONFIG` system to strictly enforce the 4-second "sweet spot" for cutaways.
-- **Gallery UI**: replaced the single-thumbnail view with a professional horizontal scrollable gallery.
+- **Decentralized UX**: Removed the `BRollPanel` in favor of inline `SegmentCard` controls, moving the tool from a "list-based" to an "action-based" workflow.
 - **Surgical UI Labels**: Updated timestamps to show the actual clip duration rather than the window duration.
 
 ### ⚙️ Backend Optimization

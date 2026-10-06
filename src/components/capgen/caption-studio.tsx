@@ -58,7 +58,6 @@ import {
 import { CaptionPreview } from "./caption-preview";
 import { StylePanel } from "./style-panel";
 import { SegmentCard } from "./segment-card";
-import { BRollPanel } from "./broll-panel";
 import { activeBrollAt, type BRollClip, buildBrollWindows } from "@/lib/broll";
 import { cn } from "@/lib/utils";
 import { applyAutoEmojis } from "@/lib/emojis";
@@ -325,15 +324,20 @@ export function CaptionStudio() {
 
   const assignClip = (segmentId: string, clip: any) => {
     setBrolls((prev) => {
-      const withoutThisWindow = prev.filter((b) => b.windowId !== clip.windowId);
+      const windowId = clip.windowId;
+      if (!windowId) return prev;
+
+      const withoutThisWindow = prev.filter((b) => b.windowId !== windowId);
       const seg = segments.find(s => s.id === segmentId);
       const start = seg?.start || 0;
+
       const duration = Math.min(4, 6);
+
       return [
         ...withoutThisWindow,
         {
           id: `${segmentId}-${clip.id}`,
-          windowId: clip.windowId,
+          windowId: windowId,
           start: start,
           end: start + duration,
           source: clip.source,
@@ -346,15 +350,118 @@ export function CaptionStudio() {
     });
   };
 
+  const fetchAndAssignBroll = async (segmentId: string, text: string) => {
+    try {
+      const res = await fetch("/api/broll", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          windows: [{
+            id: `direct-${segmentId}`,
+            start: 0,
+            end: 6,
+            query: text
+          }]
+        }),
+      });
+
+      if (!res.ok) throw new Error("Failed to fetch B-roll");
+      const data = await res.json();
+
+      if (!data.success || !data.results || data.results.length === 0) {
+        toast({ title: "No clips found", description: `Could not find B-roll for "${text}"`, variant: "destructive" });
+        return;
+      }
+
+      const bestClip = data.results[0].clips?.[0];
+      if (!bestClip) {
+        toast({ title: "No clips found", description: "The search returned no visual matches.", variant: "destructive" });
+        return;
+      }
+
+      const seg = segments.find(s => s.id === segmentId);
+      const start = seg?.start || 0;
+      const duration = Math.min(4, 6);
+
+      setBrolls((prev) => {
+        const windowId = `direct-${segmentId}`;
+        const withoutThisWindow = prev.filter((b) => b.windowId !== windowId);
+        return [
+          ...withoutThisWindow,
+          {
+            id: `${segmentId}-${bestClip.id}`,
+            windowId: windowId,
+            start: start,
+            end: start + duration,
+            source: bestClip.source,
+            previewUrl: bestClip.previewUrl,
+            thumbnail: bestClip.thumbnail,
+            query: text,
+            durationHint: bestClip.durationHint,
+          },
+        ].sort((a, b) => a.start - b.start);
+      });
+
+      toast({ title: "B-roll added", description: `Added clip for "${text}"` });
+    } catch (e) {
+      console.error("Direct B-roll error:", e);
+      toast({ title: "Error", description: "Failed to add B-roll automatically.", variant: "destructive" });
+    }
+  };
+
   const removeClip = (windowId: string) => {
     setBrolls((prev) => prev.filter((b) => b.windowId !== windowId));
   };
 
-  const regenerateClip = (clip: BRollClip) => {
-    const s = suggestions[clip.windowId];
+  const regenerateClip = async (clip: BRollClip) => {
+    const windowId = clip.windowId;
+    let s = suggestions[windowId];
+
     if (!s || !s.clips || s.clips.length === 0) {
-      toast({ title: "No clips available", description: "Cannot regenerate without available clips." });
-      return;
+      try {
+        const res = await fetch("/api/broll", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            windows: [{
+              id: windowId,
+              start: clip.start,
+              end: clip.end,
+              query: clip.query
+            }]
+          }),
+        });
+        const data = await res.json();
+        if (!data.success || !data.results?.[0]?.clips?.length) {
+          toast({ title: "No clips available", description: "Could not find alternative clips.", variant: "destructive" });
+          return;
+        }
+
+        const newClips = data.results[0].clips;
+        const currentClipId = clip.id.includes('-') ? clip.id.split('-').pop() : clip.id;
+        const filteredClips = newClips.filter(c => c.id !== currentClipId);
+
+        if (filteredClips.length === 0) {
+          toast({ title: "Same clip found", description: "API returned the same clip.", variant: "destructive" });
+          return;
+        }
+
+        // Initialize suggestions for this window so future regenerates are instant
+        const suggestionResult = {
+          windowId,
+          start: clip.start,
+          end: clip.end,
+          query: clip.query,
+          clips: newClips,
+          currentIndex: 0
+        };
+        setSuggestions(prev => ({ ...prev, [windowId]: suggestionResult }));
+        s = suggestionResult;
+      } catch (e) {
+        console.error("Regen error:", e);
+        toast({ title: "Error", description: "Failed to regenerate clip.", variant: "destructive" });
+        return;
+      }
     }
 
     const nextIndex = (s.currentIndex + 1) % s.clips.length;
@@ -362,20 +469,20 @@ export function CaptionStudio() {
 
     setSuggestions(prev => ({
       ...prev,
-      [clip.windowId]: {
+      [windowId]: {
         ...s,
         currentIndex: nextIndex
       }
     }));
 
     setBrolls((prev) => {
-      const withoutThisWindow = prev.filter((b) => b.windowId !== clip.windowId);
-      const duration = Math.min(4, 6); // Consistent with assignClip
+      const withoutThisWindow = prev.filter((b) => b.windowId !== windowId);
+      const duration = Math.min(clip.end - clip.start, 4);
       return [
         ...withoutThisWindow,
         {
-          id: `${clip.windowId}-${selectedClip.id}`,
-          windowId: clip.windowId,
+          id: `${windowId}-${selectedClip.id}`,
+          windowId: windowId,
           start: clip.start,
           end: clip.start + duration,
           source: selectedClip.source,
@@ -1056,16 +1163,41 @@ export function CaptionStudio() {
                   />
                   {/* Professional Seek Bar */}
                   <div
-                    className="relative h-1.5 w-full cursor-pointer rounded-full bg-secondary overflow-hidden group"
+                    className="relative h-2 w-full cursor-pointer rounded-full bg-secondary overflow-hidden group"
                     onClick={(e) => {
                       const rect = e.currentTarget.getBoundingClientRect();
                       const pos = (e.clientX - rect.left) / rect.width;
                       seekTo(pos * duration);
                     }}
                   >
+                    {/* B-Roll Markers - Rendered FIRST so they are in the background */}
+                    <div className="absolute inset-0 pointer-events-none flex items-center">
+                      {brolls && brolls.map((b) => {
+                        const left = duration > 0 ? (b.start / duration) * 100 : 0;
+                        const width = duration > 0 ? ((b.end - b.start) / duration) * 100 : 0;
+                        if (duration <= 0) return null;
+                        return (
+                          <div
+                            key={b.id}
+                            className="absolute h-full bg-[#FF6B1A] z-0"
+                            style={{
+                              left: `${left}%`,
+                              width: `${width}%`,
+                            }}
+                            title={`B-Roll: ${b.query}`}
+                          />
+                        );
+                      })}
+                    </div>
+                    {/* Playhead - Using a distinct style to ensure it doesn't "wipe out" the orange */}
                     <div
-                      className="absolute h-full bg-primary transition-all duration-100 ease-linear"
-                      style={{ width: `${(currentTime / duration) * 100}%` }}
+                      className="absolute top-0 h-full bg-white/30 transition-all duration-100 ease-linear z-10"
+                      style={{ width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }}
+                    />
+                    {/* Playhead Indicator Line - The sharp white line */}
+                    <div
+                      className="absolute top-0 bottom-0 w-0.5 bg-white z-20"
+                      style={{ left: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }}
                     />
                   </div>
 
@@ -1385,7 +1517,6 @@ export function CaptionStudio() {
                 {[
                   { id: "captions", label: "Captions", icon: TypeIcon },
                   { id: "style", label: "Style", icon: Settings2 },
-                  { id: "broll", label: "B-Roll", icon: Film },
                 ].map((tab) => (
                   <button
                     key={tab.id}
@@ -1427,22 +1558,32 @@ export function CaptionStudio() {
                           No segments yet. Generate captions or click <strong className="text-primary">Add Segment</strong>.
                         </div>
                       )}
-                      {segments.map((seg, i) => (
-                        <SegmentCard
-                          key={seg.id}
-                          index={i}
-                          segment={seg}
-                          isActive={activeIdx === i}
-                          onUpdate={updateSegment}
-                          onDelete={(id) => updateSegment(id, { deleted: true })}
-                          onSeek={seekTo}
-                          broll={brolls.find(b => b.windowId === `w-${seg.start.toFixed(1)}`)}
-                          onAssignBroll={assignClip}
-                          onRegenerateBroll={regenerateClip}
-                          onRemoveBroll={removeClip}
-                          suggestions={suggestions}
-                        />
-                      ))}
+                      {segments.map((seg, i) => {
+                        // We need to check for b-rolls using BOTH the window-based ID
+                        // and the direct-assignment ID used by fetchAndAssignBroll
+                        const broll = brolls.find(b =>
+                          b.windowId === `w-${seg.start.toFixed(1)}` ||
+                          b.windowId === `direct-${seg.id}`
+                        );
+
+                        return (
+                          <SegmentCard
+                            key={seg.id}
+                            index={i}
+                            segment={seg}
+                            isActive={activeIdx === i}
+                            onUpdate={updateSegment}
+                            onDelete={(id) => updateSegment(id, { deleted: true })}
+                            onSeek={seekTo}
+                            broll={broll}
+                            onAssignBroll={assignClip}
+                            onRegenerateBroll={regenerateClip}
+                            onRemoveBroll={removeClip}
+                            onFetchAndAssignBroll={fetchAndAssignBroll}
+                            suggestions={suggestions}
+                          />
+                        );
+                      })}
                     </div>
                   </ScrollArea>
                 </div>
@@ -1465,17 +1606,6 @@ export function CaptionStudio() {
                     onWordsPerCaptionChange={setWordsPerCaption}
                   />
                 </div>
-              )}
-
-              {activeTab === "broll" && (
-                <BRollPanel
-                  segments={segments}
-                  brolls={brolls}
-                  onAssignBroll={assignClip}
-                  onRemoveBroll={removeClip}
-                  onRegenerateBroll={regenerateClip}
-                  suggestions={suggestions}
-                />
               )}
             </div>
           </div>
