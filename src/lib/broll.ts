@@ -14,6 +14,8 @@ export type BRollClip = {
   thumbnail: string;
   query: string;
   durationHint?: number; // source clip's own duration, for info only
+  trimStart?: number; // offset in seconds
+  trimEnd?: number; // offset in seconds
 };
 
 export type BRollWindow = {

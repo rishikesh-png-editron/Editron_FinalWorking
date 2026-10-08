@@ -98,12 +98,87 @@ export function CaptionStudio() {
 
   const fetchSuggestions = async () => {
     if (!segments.length) return;
-    const w = buildBrollWindows(segments, { windowSeconds: 6 });
+
+    // 1. Semantic Scoring: Identify "Anchor" segments for B-roll
+    const MIN_GAP = 5.0; // Minimum seconds between clips
+    const MAX_GAP = 15.0; // Try to find a clip at least every 15s
+    const finalWindows: any[] = [];
+
+    // Stop words to ignore for scoring and querying
+    const STOP_WORDS = new Set([
+      "the", "a", "an", "this", "that", "and", "or", "but", "in", "on", "at", "to", "from", "by", "of", "with", "is", "are", "was", "were", "be", "been", "being", "it", "i", "you", "he", "she", "we", "they", "my", "your", "his", "her", "its", "our", "their", "can", "could", "will", "would", "should", "may", "might", "must", "do", "does", "did", "have", "has", "had"
+    ]);
+
+    const cleanQuery = (text: string) => {
+      const words = text.toLowerCase().split(/\s+/);
+      const filtered = words.filter(w => !STOP_WORDS.has(w) && w.length > 1);
+      return filtered.length > 0 ? filtered.join(" ") : text;
+    };
+
+    const calculateScore = (text: string) => {
+      const words = text.toLowerCase().split(/\s+/);
+      if (words.length < 2) return 0.1; // Too short to be a main point
+      if (words.length > 12) return 0.3; // Too long, likely a rambling sentence
+
+      let score = 0;
+      words.forEach(w => {
+        if (!STOP_WORDS.has(w) && w.length > 3) score += 1; // Reward descriptive words
+      });
+
+      return score / words.length; // Normalize by length
+    };
+
+    let currentSearchStart = 0;
+
+    while (currentSearchStart < (segments[segments.length - 1]?.end || 0)) {
+      const windowEnd = currentSearchStart + MAX_GAP;
+      const candidates = segments.filter(s => s.start >= currentSearchStart && s.start <= windowEnd);
+
+      if (candidates.length > 0) {
+        // Find the most "meaningful" segment in this window
+        let bestSeg = candidates[0];
+        let maxScore = -1;
+
+        candidates.forEach(s => {
+          const score = calculateScore(s.text);
+          if (score > maxScore) {
+            maxScore = score;
+            bestSeg = s;
+          }
+        });
+
+        // Only apply if it's actually descriptive (score > 0.2)
+        if (maxScore > 0.2) {
+          finalWindows.push({
+            id: `auto-${bestSeg.id}`,
+            start: bestSeg.start,
+            end: bestSeg.end,
+            query: cleanQuery(bestSeg.text)
+          });
+          currentSearchStart = bestSeg.end + MIN_GAP;
+        } else {
+          currentSearchStart += 5.0; // Slide window forward to find something better
+        }
+      } else {
+        currentSearchStart += 5.0;
+      }
+    }
+
+    // Fallback: If absolutely nothing was found, take the first segment to avoid empty video
+    if (finalWindows.length === 0 && segments.length > 0) {
+      finalWindows.push({
+        id: `auto-${segments[0].id}`,
+        start: segments[0].start,
+        end: segments[0].end,
+        query: cleanQuery(segments[0].text)
+      });
+    }
+
     try {
       const res = await fetch("/api/broll", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ windows: w.map((x) => ({ id: x.id, start: x.start, end: x.end, query: x.query })) }),
+        body: JSON.stringify({ windows: finalWindows }),
       });
       if (!res.ok) {
         throw new Error(`Server responded with ${res.status}: ${res.statusText}`);
@@ -115,6 +190,32 @@ export function CaptionStudio() {
           map[r.windowId] = { ...r, currentIndex: 0 };
         });
         setSuggestions(map);
+
+        // Auto-assign the first clip for each auto-detected window to make it "automatic"
+        const autoAssignments: BRollClip[] = [];
+        (data.results as any[]).forEach(r => {
+          if (r.windowId.startsWith("auto-") && r.clips?.[0]) {
+            const clip = r.clips[0];
+            const seg = segments.find(s => s.id === r.windowId.replace("auto-", ""));
+            if (seg) {
+              autoAssignments.push({
+                id: `${seg.id}-${clip.id}`,
+                windowId: r.windowId,
+                start: seg.start,
+                end: Math.max(seg.end, seg.start + 3),
+                source: clip.source,
+                previewUrl: clip.previewUrl,
+                thumbnail: clip.thumbnail,
+                query: clip.query,
+                durationHint: clip.durationHint,
+              });
+            }
+          }
+        });
+
+        if (autoAssignments.length > 0) {
+          setBrolls(prev => [...prev, ...autoAssignments].sort((a, b) => a.start - b.start));
+        }
       } else {
         console.error("B-roll API error:", data.error);
       }
@@ -242,11 +343,12 @@ export function CaptionStudio() {
       await new Promise((r) => setTimeout(r, 250));
 
       const rawSegs: any[] = (data.captions || []).map(
-        (c: { id?: string; start: number; end: number; text: string }, i: number) => ({
+        (c: { id?: string; start: number; end: number; text: string; v_score?: number }, i: number) => ({
           id: c.id || `seg-${i}-${Math.random().toString(36).slice(2, 8)}`,
           start: c.start,
           end: c.end,
           text: c.text,
+          v_score: c.v_score || 0,
         })
       );
 
@@ -331,7 +433,7 @@ export function CaptionStudio() {
       const seg = segments.find(s => s.id === segmentId);
       const start = seg?.start || 0;
 
-      const duration = Math.min(4, 6);
+      const duration = Math.max(3, Math.min(4, 6));
 
       return [
         ...withoutThisWindow,
@@ -381,7 +483,7 @@ export function CaptionStudio() {
 
       const seg = segments.find(s => s.id === segmentId);
       const start = seg?.start || 0;
-      const duration = Math.min(4, 6);
+      const duration = Math.max(3, Math.min(4, 6));
 
       setBrolls((prev) => {
         const windowId = `direct-${segmentId}`;
@@ -415,6 +517,7 @@ export function CaptionStudio() {
 
   const regenerateClip = async (clip: BRollClip) => {
     const windowId = clip.windowId;
+    const query = clip.query;
     let s = suggestions[windowId];
 
     if (!s || !s.clips || s.clips.length === 0) {
@@ -427,7 +530,7 @@ export function CaptionStudio() {
               id: windowId,
               start: clip.start,
               end: clip.end,
-              query: clip.query
+              query: query
             }]
           }),
         });
@@ -451,7 +554,7 @@ export function CaptionStudio() {
           windowId,
           start: clip.start,
           end: clip.end,
-          query: clip.query,
+          query: query,
           clips: newClips,
           currentIndex: 0
         };
@@ -477,7 +580,7 @@ export function CaptionStudio() {
 
     setBrolls((prev) => {
       const withoutThisWindow = prev.filter((b) => b.windowId !== windowId);
-      const duration = Math.min(clip.end - clip.start, 4);
+      const duration = Math.max(3, Math.min(clip.end - clip.start, 4));
       return [
         ...withoutThisWindow,
         {
@@ -488,7 +591,7 @@ export function CaptionStudio() {
           source: selectedClip.source,
           previewUrl: selectedClip.previewUrl,
           thumbnail: selectedClip.thumbnail,
-          query: clip.query,
+          query: query,
           durationHint: selectedClip.durationHint,
         },
       ].sort((a, b) => a.start - b.start);
@@ -1166,19 +1269,20 @@ export function CaptionStudio() {
                     className="relative h-2 w-full cursor-pointer rounded-full bg-secondary overflow-hidden group"
                     onClick={(e) => {
                       const rect = e.currentTarget.getBoundingClientRect();
-                      const pos = (e.clientX - rect.left) / rect.width;
+                      const x = e.clientX - rect.left;
+                      const pos = Math.max(0, Math.min(1, x / rect.width));
                       seekTo(pos * duration);
                     }}
                   >
                     {/* B-Roll Markers - Rendered FIRST so they are in the background */}
                     <div className="absolute inset-0 pointer-events-none flex items-center">
-                      {brolls && brolls.map((b) => {
+                      {brolls && brolls.map((b, idx) => {
                         const left = duration > 0 ? (b.start / duration) * 100 : 0;
                         const width = duration > 0 ? ((b.end - b.start) / duration) * 100 : 0;
                         if (duration <= 0) return null;
                         return (
                           <div
-                            key={b.id}
+                            key={`${b.id}-${idx}`}
                             className="absolute h-full bg-[#FF6B1A] z-0"
                             style={{
                               left: `${left}%`,
@@ -1563,7 +1667,10 @@ export function CaptionStudio() {
                         // and the direct-assignment ID used by fetchAndAssignBroll
                         const broll = brolls.find(b =>
                           b.windowId === `w-${seg.start.toFixed(1)}` ||
-                          b.windowId === `direct-${seg.id}`
+                          b.windowId === `direct-${seg.id}` ||
+                          b.windowId === `manual-${seg.id}` ||
+                          b.windowId === `user-upload-${seg.id}` ||
+                          b.windowId.startsWith(`auto-`) && b.windowId.replace("auto-", "") === seg.id
                         );
 
                         return (

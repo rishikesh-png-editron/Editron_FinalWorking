@@ -1,54 +1,75 @@
 # CapGen B-Roll Engine: Technical Documentation & Progress Report
 
 ## 1. Overview
-The B-Roll engine was evolved from a simple browser-based recording system to a professional **Server-Side Rendering Engine**. The goal is to allow AI-driven B-roll suggestions that are automatically applied to a video, editable by the user, and rendered using FFmpeg to ensure high quality and aspect-ratio consistency.
+The B-Roll engine is a professional Server-Side Rendering (SSR) system that allows AI-driven or user-uploaded B-roll clips to be automatically applied to a video. The system ensures high-quality, aspect-ratio consistent cutaways that are fully editable by the user.
 
 ## 2. Architecture & Workflow
 
 ### A. Frontend (React/Next.js)
-- **`broll-panel.tsx`**: The control center.
-    - **AI Suggestions**: Integrates with `/api/broll` to fetch matching clips based on transcript windows (default 6s).
-    - **Auto-Apply**: Logic to automatically take the best matching clip for every segment and add it to the project timeline.
-    - **Management**: Users can "Regenerate" (fetch a new clip for that specific window) or "Remove" (detach from video but keep in the panel for easy re-application).
-    - **State Sync**: Uses `setBrolls` to maintain a sorted list of clips by start time.
-- **`caption-preview.tsx`**: The visual layer.
-    - **Layered Stack**: Implemented a z-index hierarchy to prevent B-roll from covering UI:
-        - `z-0`: Main Video
-        - `z-10`: B-Roll Overlay (with `pointer-events-none`)
-        - `z-20`: Captions/Textt
-        - `z-30`: UI Overlays (Aspect ratio tags, Preview labels)
+The frontend manages the interaction between the user's transcript and the B-roll assets.
 
-### B. Backend (Python/Hyper-Engine)
-- **`renderer.py`**: The FFmpeg Command Generator.
-    - **Resolution Detection**: Uses `ffprobe` to get the exact width/height of the uploaded video.
-    - **Fill/Cover Logic**: Implements `scale=W:H:force_original_aspect_ratio=increase,crop=W:H` to ensure B-roll clips fill the screen regardless of their original format (9:16, 16:9, etc.).
-    - **Cutaway Chain**: Builds a `filter_complex` string that overlays B-roll clips at specific timestamps while keeping the original audio stream (`-map 0:a`).
-- **`render_pipeline.py`**: The Orchestrator.
-    - Coordinates: B-Roll Asset Download $\to$ Transcription $\to$ Project Synthesis $\to$ Final FFmpeg Render.
-- **`bridge.py`**: Synthesizes the final project JSON, ensuring B-roll metadata is preserved for the renderer.
+- **`broll-panel.tsx` & `caption-studio.tsx`**:
+    - Orchestrates the B-roll state.
+    - Uses a `windowId` mapping system to link clips to specific caption segments.
+    - **Crucial Logic**: Recognizes various ID prefixes (`auto-`, `manual-`, `direct-`, and `user-upload-`) to ensure the correct clip is passed to the `SegmentCard`.
+- **`segment-card.tsx`**:
+    - The primary UI for B-roll management per segment.
+    - Displays an "Applied" badge when a clip is linked.
+    - Provides a **Thumbnail** preview and a **Remove** button.
+    - Features a dynamic action button: shows **"Regenerate"** for AI clips and **"Re-trim"** for user uploads.
+- **`broll-trimmer-modal.tsx`**:
+    - A precision tool for users to select the exact start and end timestamps of an uploaded clip.
+    - Communicates trim values back to the project state via `onAssignBroll`.
 
-## 3. Key Technical Achievements
-- **Aspect Ratio Independence**: The engine no longer assumes 9:16. It detects source dimensions and crops B-roll dynamically.
-- **Audio Preservation**: The final render uses `-c:a copy`, ensuring original audio is untouched and synced.
-- **UI UX Improvement**: Moved from a two-section layout to a single "B-Roll Timeline" for reduced friction.
-- **Z-Index Fix**: Resolved the issue where B-roll clips were hiding the playback/pause buttons.
+### B. API Layer (Next.js Routes)
+Acts as the bridge between the browser and the server's filesystem.
 
-## 4. Current Status & Pending Tasks
+- **`/api/broll/upload`**:
+    - Handles file uploads to `storage/user_uploads`.
+    - **Automatic Thumbnailing**: Uses FFmpeg to extract a frame at 0.1s as a `.jpg` so the browser can display a preview image.
+    - Returns a streaming URL via the video helper.
+- **`/api/video`**:
+    - A streaming proxy that reads absolute file paths from the server disk and streams them to the browser with the correct `video/mp4` MIME type, bypassing browser security restrictions on local files.
 
-### ✅ Completed
-- [x] Server-side FFmpeg rendering logic.
+### C. Backend Rendering (Python/Hyper-Engine)
+The "heavy lifter" that produces the final MP4.
+
+- **`render_pipeline.py`**:
+    - Orchestrates the full process: Asset Download $\to$ Transcription $\to$ Synthesis $\to$ Rendering.
+    - Extracts `trimStart` and `trimEnd` from the project JSON to pass to the renderer.
+- **`renderer.py`**:
+    - Generates complex FFmpeg commands.
+    - **Precision Trimming**: Uses the filter `trim=start={trimStart}:duration={duration}` to ensure the exact user-selected portion of a clip is used.
+    - **Aspect Ratio Handling**: Implements `scale=W:H:force_original_aspect_ratio=increase,crop=W:H` to ensure clips fill the screen regardless of original format.
+    - **Visual Polish**: Adds "Projector Glow" and "Analog Burn" transitions at the start and end of every B-roll cutaway.
+
+## 3. Key Technical Implementations (Updated Oct 2026)
+
+| Feature | Implementation Detail | Benefit |
+| :--- | :--- | :--- |
+| **User Uploads** | `storage/user_uploads` $\to$ `/api/video` proxy | Allows custom assets without public folder clutter. |
+| **Auto-Thumbnails** | `ffmpeg -ss 0.1 -vframes 1` | Instant visual feedback in the UI. |
+| **Exact Trimming** | `trim=start=X:duration=Y` filter | Eliminates "wrong clip section" bugs. |
+| **State Sync** | `user-upload-${seg.id}` mapping | Ensures uploaded clips persist and are editable. |
+| **UI Layering** | Z-index hierarchy (0 $\to$ 30) | B-roll overlays don't block captions or controls. |
+
+## 4. Maintenance Guide for Future Updates
+
+### To change the UI:
+- Modify `src/components/capgen/segment-card.tsx` for the layout.
+- Modify `src/components/capgen/broll-trimmer-modal.tsx` for the trimming experience.
+
+### To change the Rendering Logic:
+- Update `mini-services/hyper-engine/renderer.py` to modify FFmpeg filters (e.g., changing transition types or scaling methods).
+- Update `mini-services/hyper-engine/render_pipeline.py` to change how assets are handled before rendering.
+
+### To change the Upload/Storage logic:
+- Update `src/app/api/broll/upload/route.ts` to change where files are saved or how thumbnails are generated.
+
+## 5. Current Status
+- [x] Server-side FFmpeg rendering with precision trim.
 - [x] AI-based clip suggestions and auto-apply.
-- [x] "Regenerate" and "Remove" functionality.
-- [x] Dynamic scaling/cropping for any aspect ratio.
-- [x] UI layering (z-index) for preview controls.
-
-### ⏳ Pending / Next Steps
-- **End-to-End Verification**: Run a full loop from UI $\to$ Backend $\to$ MP4 to ensure timing is millisecond-perfect.
-- **Production Optimization**: Transition from CPU rendering to GPU acceleration (NVENC) for faster exports.
-- **Asset Cleanup**: Ensure `temp_assets` are purged immediately after rendering to save disk space.
-
-## 5. Quick Start for Developer
-To test the engine:
-1. Run `mini-services/whisper-service` (for transcription).
-2. Run the `hyper-engine` pipeline via `python render_pipeline.py <video_path> <style_id>`.
-3. Verify the output at `output_final.mp4`.
+- [x] User upload flow with automatic thumbnail generation.
+- [x] Re-trimming functionality for custom assets.
+- [x] Dynamic aspect ratio scaling and cropping.
+- [x] UI state synchronization across the studio.

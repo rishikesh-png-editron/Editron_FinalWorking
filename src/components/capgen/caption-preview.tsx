@@ -207,6 +207,22 @@ export function CaptionPreview({
             muted
             loop
             playsInline
+            onTimeUpdate={(e) => {
+              const v = e.currentTarget;
+              const start = activeBroll.trimStart ?? 0;
+              const end = activeBroll.trimEnd ?? v.duration;
+              if (v.currentTime < start) {
+                v.currentTime = start;
+              } else if (v.currentTime >= end) {
+                v.currentTime = start;
+              }
+            }}
+            onLoadedMetadata={(e) => {
+              const v = e.currentTarget;
+              if (activeBroll.trimStart !== undefined) {
+                v.currentTime = activeBroll.trimStart;
+              }
+            }}
           />
         )}
 

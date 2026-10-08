@@ -44,7 +44,9 @@ class HyperCaptionsPipeline:
                         broll_render_data.append({
                             "path": broll_map[i],
                             "start": broll.get("start", 0),
-                            "end": broll.get("end", 0)
+                            "end": broll.get("end", 0),
+                            "trimStart": broll.get("trimStart", 0),
+                            "trimEnd": broll.get("trimEnd", None)
                         })
 
             # STEP 1: Transcribe via CapGen Whisper Service

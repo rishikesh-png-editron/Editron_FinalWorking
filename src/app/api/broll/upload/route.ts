@@ -2,6 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "fs/promises";
 import path from "path";
 import { nanoid } from "nanoid";
+import { exec } from "child_process";
+import { promisify } from "util";
+
+const execPromise = promisify(exec);
 
 export const runtime = "nodejs";
 
@@ -34,15 +38,27 @@ export async function POST(req: NextRequest) {
 
     const fileName = `${nanoid()}${extension}`;
     const filePath = path.join(UPLOAD_DIR, fileName);
+    const thumbName = `${nanoid()}.jpg`;
+    const thumbPath = path.join(UPLOAD_DIR, thumbName);
 
     const buffer = Buffer.from(await file.arrayBuffer());
     await fs.writeFile(filePath, buffer);
 
-    // Construct a public URL for the file.
-    // Note: In a production Next.js app, files in 'storage' aren't automatically public.
-    // For this local setup, we'll return the relative path and let the frontend handle it,
-    // or assume there's a static server mapping.
-    const publicUrl = `/storage/user_uploads/${fileName}`;
+    // Generate thumbnail if it's a video
+    if (extension === ".mp4" || extension === ".mov") {
+      try {
+        // Extract frame at 0.1s, size 320x180
+        await execPromise(`ffmpeg -ss 0.1 -i "${filePath}" -vframes 1 -s 320x180 "${thumbPath}"`);
+      } catch (e) {
+        console.error("Thumbnail generation failed:", e);
+      }
+    }
+
+    // Use the /api/video helper to stream files from the storage directory
+    const publicUrl = `/api/video?path=${encodeURIComponent(filePath)}`;
+    const publicThumbUrl = extension === ".mp4" || extension === ".mov"
+      ? `/api/video?path=${encodeURIComponent(thumbPath)}`
+      : publicUrl;
 
     return NextResponse.json({
       success: true,
@@ -50,7 +66,7 @@ export async function POST(req: NextRequest) {
         id: `user-${nanoid()}`,
         source: "user",
         previewUrl: publicUrl,
-        thumbnail: publicUrl, // For images, the file is the thumbnail. For videos, this is a simplification.
+        thumbnail: publicThumbUrl,
         query: file.name,
       },
     });

@@ -21,6 +21,21 @@ import shutil
 import subprocess
 import tempfile
 import traceback
+import numpy as np
+
+# New dependencies for Intelligence Layer
+try:
+    import librosa
+    import nltk
+    from nltk.tokenize import word_tokenize
+    from nltk.corpus import stopwords
+    # Download necessary NLTK data
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    nltk.download('averaged_perceptron_tagger', quiet=True)
+    NLTK_AVAILABLE = True
+except ImportError:
+    NLTK_AVAILABLE = False
 
 # Limit threads to avoid sandbox CPU limits
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -28,7 +43,6 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".wmv", ".m4v", ".mpg", ".mpeg"}
 
 # Map CapGen language codes to whisper language hints.
-# This helps whisper pick the right decoder for Indic languages (Telugu, Hindi, etc.)
 LANG_MAP = {
     "en": "en", "en-US": "en", "en-GB": "en", "en-IN": "en",
     "hi": "hi", "hinglish": "hi",
@@ -48,11 +62,8 @@ LANG_MAP = {
     "th": "th", "vi": "vi", "uk": "uk",
 }
 
-
 def extract_audio_to_wav(src_path: str, max_duration_sec: int = 180) -> str | None:
-    """Extract audio from a video/audio file to a 16kHz mono WAV using ffmpeg.
-    Caps duration at max_duration_sec to avoid timeouts on long videos.
-    Returns the path to the temp WAV, or None on failure."""
+    """Extract audio from a video/audio file to a 16kHz mono WAV using ffmpeg."""
     if not shutil.which("ffmpeg"):
         return None
     out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -62,10 +73,8 @@ def extract_audio_to_wav(src_path: str, max_duration_sec: int = 180) -> str | No
             [
                 "ffmpeg", "-y",
                 "-i", src_path,
-                "-vn",              # no video
-                "-ac", "1",         # mono
-                "-ar", "16000",     # 16kHz — best for whisper
-                "-t", str(max_duration_sec),  # cap duration
+                "-vn", "-ac", "1", "-ar", "16000",
+                "-t", str(max_duration_sec),
                 "-f", "wav",
                 out.name,
             ],
@@ -73,14 +82,11 @@ def extract_audio_to_wav(src_path: str, max_duration_sec: int = 180) -> str | No
             timeout=90,
         )
         if result.returncode != 0 or not os.path.exists(out.name) or os.path.getsize(out.name) == 0:
-            # Try without duration cap (some ffmpeg versions handle -t differently)
             result2 = subprocess.run(
                 [
                     "ffmpeg", "-y",
                     "-i", src_path,
-                    "-vn",
-                    "-ac", "1",
-                    "-ar", "16000",
+                    "-vn", "-ac", "1", "-ar", "16000",
                     "-f", "wav",
                     out.name,
                 ],
@@ -88,27 +94,80 @@ def extract_audio_to_wav(src_path: str, max_duration_sec: int = 180) -> str | No
                 timeout=120,
             )
             if result2.returncode != 0 or not os.path.exists(out.name) or os.path.getsize(out.name) == 0:
-                try:
-                    os.unlink(out.name)
-                except OSError:
-                    pass
+                try: os.unlink(out.name)
+                except OSError: pass
                 return None
         return out.name
-    except subprocess.TimeoutExpired:
-        try:
-            os.unlink(out.name)
-        except OSError:
-            pass
-        return None
-    except Exception:
-        try:
-            os.unlink(out.name)
-        except OSError:
-            pass
+    except (subprocess.TimeoutExpired, Exception):
+        try: os.unlink(out.name)
+        except OSError: pass
         return None
 
+def calculate_v_score(text: str, start: float, end: float, audio_path: str, full_audio_rms: float) -> float:
+    """
+    Calculate the Visual Importance Score (V_score) for a segment.
+    Formula: (0.5 * TextWeight) + (0.3 * AudioEnergy) + (0.2 * InfoDensity)
+    """
+    if not NLTK_AVAILABLE:
+        return 0.0
+
+    # 1. Textual Weighting (0.0 to 1.0)
+    try:
+        tokens = word_tokenize(text.lower())
+        if not tokens:
+            text_weight = 0.0
+        else:
+            stop_words = set(stopwords.words('english'))
+            score = 0
+            # Simple weighting: Adjectives/Nouns > Others
+            tagged = nltk.pos_tag(tokens)
+            for word, tag in tagged:
+                if word in stop_words:
+                    continue
+                if tag.startswith('JJ'): # Adjective
+                    score += 3
+                elif tag.startswith('NN'): # Noun
+                    score += 2
+                else:
+                    score += 1
+            # Normalize by length (capped at 1.0)
+            text_weight = min(1.0, score / (len(tokens) * 2))
+    except Exception:
+        text_weight = 0.0
+
+    # 2. Audio Energy Analysis (0.0 to 1.0)
+    try:
+        y, sr = librosa.load(audio_path, sr=16000)
+        start_sample = int(start * sr)
+        end_sample = int(end * sr)
+        segment_audio = y[start_sample:end_sample]
+        if len(segment_audio) == 0:
+            audio_energy = 0.0
+        else:
+            rms = np.sqrt(np.mean(segment_audio**2))
+            # Normalize relative to the mean of the full clip
+            audio_energy = min(1.0, rms / (full_audio_rms + 1e-6))
+    except Exception:
+        audio_energy = 0.0
+
+    # 3. Information Density (0.0 to 1.0)
+    try:
+        tokens = word_tokenize(text.lower())
+        if not tokens:
+            info_density = 0.0
+        else:
+            stop_words = set(stopwords.words('english'))
+            content_words = [w for w in tokens if w not in stop_words]
+            info_density = len(content_words) / len(tokens)
+    except Exception:
+        info_density = 0.0
+
+    return round((0.5 * text_weight) + (0.3 * audio_energy) + (0.2 * info_density), 3)
 
 def main():
+    # DEBUG MARKER: If this prints, we are editing the right file
+    print(json.dumps({"success": False, "debug": "EXECUTING CORRECT SCRIPT"}), file=sys.stderr)
+
     if len(sys.argv) < 2:
         print(json.dumps({"success": False, "error": "Usage: transcribe.py <file> [words_per_caption] [mode] [language]"}))
         sys.exit(1)
@@ -120,8 +179,7 @@ def main():
 
     try:
         words_per_caption = int(sys.argv[2]) if len(sys.argv) > 2 else 6
-        if words_per_caption < 1:
-            words_per_caption = 1
+        if words_per_caption < 1: words_per_caption = 1
     except (ValueError, TypeError):
         words_per_caption = 6
 
@@ -129,33 +187,23 @@ def main():
     if mode not in ("transcribe", "translate"):
         mode = "transcribe"
 
-    # Optional 4th arg: language hint (e.g. "te" for Telugu)
     lang_arg = sys.argv[4] if len(sys.argv) > 4 else ""
     whisper_lang = LANG_MAP.get(lang_arg, None) if lang_arg else None
 
-    # Use "small" model by default — it supports 96+ languages including Telugu,
-    # Hindi, Tamil, etc. The "tiny" model is English-only-ish and butchers Indic languages.
     model_size = os.environ.get("WHISPER_MODEL_SIZE", "small")
     beam_size = int(os.environ.get("WHISPER_BEAM_SIZE", "3"))
 
-    # For video AND audio files, extract to a clean 16kHz mono WAV first.
-    # This is much more reliable than letting whisper decode containers directly
-    # (fixes MP4 failures and standardizes the input).
     ext = os.path.splitext(media_path)[1].lower()
     temp_wav = None
     whisper_input = media_path
-    # Always try extraction for video; for audio, only if it's not already a clean wav
     should_extract = ext in VIDEO_EXTS or ext not in {".wav"}
     if should_extract:
         temp_wav = extract_audio_to_wav(media_path)
         if temp_wav:
             whisper_input = temp_wav
-        # If extraction failed, fall back to passing the file directly —
-        # faster-whisper uses pyav internally and may still decode it.
 
     try:
         from faster_whisper import WhisperModel
-
         model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=1)
 
         transcribe_kwargs = {
@@ -164,8 +212,6 @@ def main():
             "word_timestamps": True,
             "task": mode,
         }
-        # Pass language hint if we have one — critical for Telugu/Hindi/Tamil etc.
-        # If not provided, whisper will auto-detect from the first 30 seconds.
         if whisper_lang:
             transcribe_kwargs["language"] = whisper_lang
 
@@ -177,89 +223,88 @@ def main():
                 all_words.extend(segment.words)
 
         if not all_words:
-            print(json.dumps({
-                "success": False,
-                "error": "No speech detected in this file. Make sure the audio contains clear speech and is not silent or music-only."
-            }))
+            print(json.dumps({"success": False, "error": "No speech detected."}))
             sys.exit(0)
 
-        # --- SMART SPLITTING LOGIC START ---
-        # We prioritize splitting at punctuation, natural pauses, and conjunctions.
-
+        # --- SMART SPLITTING LOGIC ---
         groups = []
         current_group = []
-
-        # Common conjunctions that are natural split points
         CONJUNCTIONS = {"and", "but", "or", "because", "so", "yet", "for", "nor"}
 
         i = 0
         while i < len(all_words):
             current_group.append(all_words[i])
-
-            # We check if we should split after the current word.
-            # We only start looking for a "smart" split once we have at least 2 words.
             if len(current_group) >= 2:
-                # Look ahead window to find the best split point
-                # We check the next few words (up to a reasonable limit, e.g., 12)
                 best_split_idx = -1
                 max_score = -1
-
-                # Check the next few words to see if there's a better place to split
-                # than just cutting at words_per_caption.
                 search_limit = min(i + 1, i + 12)
                 for j in range(i, search_limit):
                     if j >= len(all_words): break
-
                     word_obj = all_words[j]
                     text = word_obj.word.strip().lower()
-
                     score = 0
-                    # 1. Strong Punctuation (Highest priority)
-                    if any(text.endswith(p) for p in (".", "!", "?")):
-                        score = 100
-                    # 2. Weak Punctuation
-                    elif any(text.endswith(p) for p in (",", ";", ":")):
-                        score = 50
-                    # 3. Natural Pause (gap between words)
+                    if any(text.endswith(p) for p in (".", "!", "?")): score = 100
+                    elif any(text.endswith(p) for p in (",", ";", ":")): score = 50
                     elif j + 1 < len(all_words):
                         gap = all_words[j+1].start - word_obj.end
-                        if gap > 0.6:
-                            score = 40
-                        elif gap > 0.3:
-                            score = 20
-                    # 4. Conjunctions
+                        if gap > 0.6: score = 40
+                        elif gap > 0.3: score = 20
                     if j + 1 < len(all_words):
                         next_text = all_words[j+1].word.strip().lower()
-                        if next_text in CONJUNCTIONS:
-                            score += 10
-
+                        if next_text in CONJUNCTIONS: score += 10
                     if score > max_score:
                         max_score = score
                         best_split_idx = j
-
-                # If we've reached the target words_per_caption,
-                # or we found a very strong split point (punctuation), we split.
                 if len(current_group) >= words_per_caption or (max_score >= 100 and i >= 3):
-                    # To avoid splitting too early (e.g., at 2 words),
-                    # we only split if we've hit the target or found a hard stop.
                     groups.append(current_group)
                     current_group = []
-                elif len(current_group) >= 12: # Hard limit to prevent massive captions
+                elif len(current_group) >= 12:
                     groups.append(current_group)
                     current_group = []
-
             i += 1
-
         if current_group:
             groups.append(current_group)
-        # --- SMART SPLITTING LOGIC END ---
+
+        # --- INTELLIGENCE LAYER: V-SCORE CALCULATION ---
+        # Calculate global RMS for normalization
+        full_audio_rms = 0.0
+        if temp_wav and NLTK_AVAILABLE:
+            try:
+                y_full, _ = librosa.load(temp_wav, sr=16000)
+                full_audio_rms = np.sqrt(np.mean(y_full**2))
+            except Exception:
+                pass
 
         captions = []
-        for group in groups:
+        for i, group in enumerate(groups):
+            start = round(group[0].start, 3)
+            end = round(group[-1].end, 3)
+            text = " ".join(w.word.strip() for w in group).strip()
+
+            v_score = 0.0
+            if temp_wav and NLTK_AVAILABLE:
+                v_score = calculate_v_score(text, start, end, temp_wav, full_audio_rms)
+
+            # FAIL-SAFE: If advanced scoring failed or returned 0, use heuristics
+            if v_score == 0:
+                # 1. Hook Boost: First 3 segments are high value
+                if i < 3: v_score += 0.4
+
+                # 2. Keyword Boost: High-energy words
+                power_words = {"secret", "amazing", "shocking", "proven", "hack", "best", "worst", "incredible", "warning", "stop"}
+                words = text.lower().split()
+                if any(w in power_words for w in words): v_score += 0.3
+
+                # 3. Length Boost: Short punchy segments (2-5 words)
+                if 2 <= len(words) <= 5: v_score += 0.2
+
+                v_score = round(min(1.0, v_score), 3)
+
             captions.append({
-                "start": round(group[0].start, 3),
-                "end": round(group[-1].end, 3),
-                "text": " ".join(w.word.strip() for w in group).strip(),
+                "start": start,
+                "end": end,
+                "text": text,
+                "v_score": v_score
             })
 
         result = {
@@ -280,15 +325,10 @@ def main():
         traceback.print_exc(file=sys.stderr)
         print(json.dumps({"success": False, "error": str(e)}))
         sys.exit(1)
-
     finally:
-        # Clean up temp WAV
         if temp_wav and os.path.exists(temp_wav):
-            try:
-                os.unlink(temp_wav)
-            except OSError:
-                pass
-
+            try: os.unlink(temp_wav)
+            except OSError: pass
 
 if __name__ == "__main__":
     main()
